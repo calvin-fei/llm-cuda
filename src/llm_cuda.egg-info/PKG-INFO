@@ -1,0 +1,88 @@
+Metadata-Version: 2.4
+Name: llm-cuda
+Version: 0.1.0
+Summary: CUDA/Triton implementation playground for LLMs
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: torch>=2.3.0
+Requires-Dist: triton>=2.3.0
+Requires-Dist: numpy>=1.26.0
+
+# llm-cuda
+
+CUDA and Triton reimplementation project for modern LLMs and LMMs.
+
+Initial target implemented: Llama 3 (training/inference scaffold + kernel hooks).
+
+## Current status: Llama 3 starter
+
+This repo now includes:
+
+- Llama 3 style decoder-only transformer in PyTorch
+- Grouped-query attention (GQA)
+- RoPE (rotary embeddings)
+- RMSNorm with Triton kernel entry point + PyTorch fallback
+- Causal LM head + loss path
+- A minimal runner for forward/backward on CPU or GPU
+- Basic shape/loss tests
+
+## Project layout
+
+```text
+src/llm_cuda/
+	models/llama3/
+		config.py
+		attention.py
+		rotary.py
+		norm.py
+		mlp.py
+		model.py
+	kernels/
+		triton/rmsnorm.py
+		cuda/rmsnorm.py
+runners/run_llama3.py
+tests/test_llama3_shapes.py
+```
+
+## Quick start
+
+Create environment and install dependencies:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+Run a minimal Llama 3 forward/backward pass:
+
+```bash
+python runners/run_llama3.py --device cuda --batch-size 2 --seq-len 128 --vocab-size 32000
+```
+
+If CUDA is unavailable:
+
+```bash
+python runners/run_llama3.py --device cpu
+```
+
+Run tests:
+
+```bash
+pytest -q
+```
+
+## Next milestones for Llama 3
+
+1. Fused Triton attention kernel (QK matmul + masking + softmax + PV).
+2. Fused SwiGLU MLP kernel.
+3. KV cache for autoregressive decoding.
+4. Tensor parallel sharding for QKV and MLP projections.
+5. CUDA C++ extension replacement for critical Triton kernels where beneficial.
+6. Checkpoint conversion from Hugging Face Llama 3 weights.
+
+## Notes
+
+- The current implementation is intentionally compact to enable iterative kernel replacement.
+- Use this as the base to progressively swap PyTorch ops with custom Triton/CUDA kernels while preserving test coverage.
