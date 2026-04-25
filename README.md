@@ -14,11 +14,15 @@ This repo now includes:
 - RMSNorm with Triton kernel entry point + PyTorch fallback
 - Initial fused Triton causal-attention forward and backward kernels (with safe fallback)
 - Fused Triton SwiGLU kernel with autograd-safe backward
+- Fused Triton RoPE kernel (forward, single-pass, half-bandwidth)
 - KV-cache support for autoregressive decoding
 - Paged KV-cache option for long-running decode workloads
 - Tensor-parallel sharding for QKV and MLP projections
 - Optional CUDA C++ extension path for RMSNorm, SwiGLU forward, and causal attention forward (with Triton/PyTorch fallback)
 - Long-context/high-concurrency optimization: automatic CUDA SDPA backend selection when beneficial
+- **Fused Triton cross-entropy loss** (forward + backward) — tiled vocab iteration eliminates the O(B×S×V) softmax peak-memory bottleneck critical at Llama 3's 128K vocab
+- **Fused Triton AdamW optimizer** — single-kernel weight decay + moment update + parameter step with `TritonAdamW` drop-in optimizer class
+- **Activation / gradient checkpointing** — per-layer recomputation during training, enabled via `gradient_checkpointing=True` in `Llama3Config`
 - Causal LM head + loss path
 - A minimal runner for forward/backward on CPU or GPU
 - Basic shape/loss tests
@@ -28,22 +32,34 @@ This repo now includes:
 ```text
 src/llm_cuda/
 	models/llama3/
-		config.py
+		config.py           (gradient_checkpointing flag added)
 		attention.py
 		rotary.py
 		norm.py
 		mlp.py
-		model.py
+		model.py            (fused CE + activation checkpointing wired in)
+		block.py
+		kv_cache.py
 	kernels/
 		triton/attention.py
+		triton/decode_attention.py
 		triton/rmsnorm.py
 		triton/swiglu.py
+		triton/rope.py
+		triton/cross_entropy.py  (NEW — tiled fwd+bwd, O(N) peak memory)
+		triton/adamw.py          (NEW — fused AdamW step + TritonAdamW class)
 		cuda/rmsnorm.py
 runners/run_llama3.py
 runners/bench_triton_attention.py
 runners/bench_triton_swiglu.py
 runners/sweep_triton_attention_stability.py
 tests/test_llama3_shapes.py
+tests/test_triton_attention.py
+tests/test_triton_decode_attention.py
+tests/test_triton_rope.py
+tests/test_triton_swiglu.py
+tests/test_triton_cross_entropy.py  (NEW)
+tests/test_triton_adamw.py          (NEW)
 ```
 
 ## Quick start
@@ -121,6 +137,8 @@ python runners/sweep_triton_attention_stability.py --batch 1 --heads 4 --head-di
 
 1. Add optimized CUDA extension implementations and benchmarking for attention/SwiGLU backward.
 2. Checkpoint conversion from Hugging Face Llama 3 weights.
+3. FP8 (Hopper/Ada) attention and linear kernels for H100 training efficiency.
+4. Speculative decoding (draft model + verification) for higher decode throughput.
 
 ## Notes
 
