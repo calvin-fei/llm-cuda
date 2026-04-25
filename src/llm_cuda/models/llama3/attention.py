@@ -2,6 +2,10 @@ import torch
 import torch.nn as nn
 
 from llm_cuda.kernels.triton.attention import triton_fused_causal_attention
+from llm_cuda.kernels.triton.decode_attention import (
+    can_use_triton_decode_attention,
+    triton_decode_attention,
+)
 from llm_cuda.parallel.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 from .config import Llama3Config
@@ -115,12 +119,19 @@ class Llama3Attention(nn.Module):
         else:
             present = (k, v) if use_cache else None
 
-        k = self._repeat_kv(k)
-        v = self._repeat_kv(v)
-
-        if past_len == 0 and q.shape[-2] == k.shape[-2] and attention_mask is None:
-            out = triton_fused_causal_attention(q, k, v, attention_mask=attention_mask)
+        # Decode fast-path: single query token + Triton flash-decode kernel.
+        # Handled before _repeat_kv so K/V are accessed at their native
+        # (unexpanded) n_kv_heads count, saving 2× memory bandwidth for GQA.
+        if q.shape[-2] == 1 and can_use_triton_decode_attention(q, k, v, attention_mask):
+            out = triton_decode_attention(q, k, v)
         else:
-            out = self._torch_attention(q, k, v, attention_mask=attention_mask, past_len=past_len)
+            k = self._repeat_kv(k)
+            v = self._repeat_kv(v)
+
+            if past_len == 0 and q.shape[-2] == k.shape[-2] and attention_mask is None:
+                out = triton_fused_causal_attention(q, k, v, attention_mask=attention_mask)
+            else:
+                out = self._torch_attention(q, k, v, attention_mask=attention_mask, past_len=past_len)
+
         out = out.transpose(1, 2).contiguous().view(bsz, seq_len, self.num_heads * self.head_dim)
         return self.o_proj(out), present
