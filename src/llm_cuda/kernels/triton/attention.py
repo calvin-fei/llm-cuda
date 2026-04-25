@@ -77,6 +77,7 @@ if triton is not None:
         k_ptr,
         v_ptr,
         o_ptr,
+        logsumexp_ptr,
         stride_qb,
         stride_qh,
         stride_qm,
@@ -93,6 +94,9 @@ if triton is not None:
         stride_oh,
         stride_om,
         stride_ok,
+        stride_lseb,
+        stride_lseh,
+        stride_lsem,
         n_heads,
         seq_len,
         head_dim,
@@ -162,6 +166,11 @@ if triton is not None:
         o_base = o_ptr + batch_idx * stride_ob + head_idx * stride_oh + pid_m * stride_om
         tl.store(o_base + offs_d * stride_ok, out, mask=offs_d < head_dim)
 
+        # Save logsumexp = m_i + log(l_i) for the backward pass.
+        lse = m_i + tl.log(l_i)
+        lse_ptr = logsumexp_ptr + batch_idx * stride_lseb + head_idx * stride_lseh + pid_m * stride_lsem
+        tl.store(lse_ptr, lse)
+
     @triton.jit
     def _fused_causal_attn_bwd(
         q_ptr,
@@ -171,6 +180,8 @@ if triton is not None:
         dq_ptr,
         dk_ptr,
         dv_ptr,
+        logsumexp_ptr,
+        delta_ptr,
         stride_qb,
         stride_qh,
         stride_qm,
@@ -199,6 +210,12 @@ if triton is not None:
         stride_dvh,
         stride_dvn,
         stride_dvk,
+        stride_lseb,
+        stride_lseh,
+        stride_lsem,
+        stride_deltab,
+        stride_deltah,
+        stride_deltam,
         n_heads,
         seq_len,
         head_dim,
@@ -220,80 +237,12 @@ if triton is not None:
         q = tl.load(q_base + offs_d * stride_qk, mask=offs_d < head_dim, other=0.0)
         do = tl.load(do_base + offs_d * stride_dok, mask=offs_d < head_dim, other=0.0)
 
-        m_i = -float("inf")
-        for start_n in tl.range(0, seq_len, BLOCK_N):
-            n_idx = start_n + offs_n
-            causal = n_idx <= pid_m
-            n_mask = (n_idx < seq_len) & causal
-
-            k_ptrs = (
-                k_ptr
-                + batch_idx * stride_kb
-                + head_idx * stride_kh
-                + n_idx[:, None] * stride_kn
-                + offs_d[None, :] * stride_kk
-            )
-            k = tl.load(k_ptrs, mask=n_mask[:, None] & (offs_d[None, :] < head_dim), other=0.0)
-
-            qk = tl.sum(k * q[None, :], axis=1) * scale
-            qk = tl.where(n_mask, qk, -float("inf"))
-            m_i = tl.maximum(m_i, tl.max(qk, axis=0))
-
-        l_i = 0.0
-        for start_n in tl.range(0, seq_len, BLOCK_N):
-            n_idx = start_n + offs_n
-            causal = n_idx <= pid_m
-            n_mask = (n_idx < seq_len) & causal
-
-            k_ptrs = (
-                k_ptr
-                + batch_idx * stride_kb
-                + head_idx * stride_kh
-                + n_idx[:, None] * stride_kn
-                + offs_d[None, :] * stride_kk
-            )
-            k = tl.load(k_ptrs, mask=n_mask[:, None] & (offs_d[None, :] < head_dim), other=0.0)
-
-            qk = tl.sum(k * q[None, :], axis=1) * scale
-            qk = tl.where(n_mask, qk, -float("inf"))
-            p = tl.exp(qk - m_i)
-            l_i += tl.sum(tl.where(n_mask, p, 0.0), axis=0)
-
-        dp_sum = 0.0
-        for start_n in tl.range(0, seq_len, BLOCK_N):
-            n_idx = start_n + offs_n
-            causal = n_idx <= pid_m
-            n_mask = (n_idx < seq_len) & causal
-
-            k_ptrs = (
-                k_ptr
-                + batch_idx * stride_kb
-                + head_idx * stride_kh
-                + n_idx[:, None] * stride_kn
-                + offs_d[None, :] * stride_kk
-            )
-            v_ptrs = (
-                v_ptr
-                + batch_idx * stride_vb
-                + head_idx * stride_vh
-                + n_idx[:, None] * stride_vn
-                + offs_d[None, :] * stride_vk
-            )
-
-            k = tl.load(k_ptrs, mask=n_mask[:, None] & (offs_d[None, :] < head_dim), other=0.0)
-            v = tl.load(v_ptrs, mask=n_mask[:, None] & (offs_d[None, :] < head_dim), other=0.0)
-
-            qk = tl.sum(k * q[None, :], axis=1) * scale
-            qk = tl.where(n_mask, qk, -float("inf"))
-            denom = tl.maximum(l_i, 1e-9)
-            p = tl.exp(qk - m_i) / denom
-            p = tl.where(n_mask, p, 0.0)
-
-            dp = tl.sum(v * do[None, :], axis=1)
-            dp = tl.where(n_mask, dp, 0.0)
-            dp_sum += tl.sum(p * dp, axis=0)
+        # Load saved logsumexp and precomputed delta D = rowsum(dO * O).
+        lse = tl.load(logsumexp_ptr + batch_idx * stride_lseb + head_idx * stride_lseh + pid_m * stride_lsem)
+        delta = tl.load(delta_ptr + batch_idx * stride_deltab + head_idx * stride_deltah + pid_m * stride_deltam)
 
         dq_acc = tl.zeros((BLOCK_DMODEL,), dtype=tl.float32)
+
         for start_n in tl.range(0, seq_len, BLOCK_N):
             n_idx = start_n + offs_n
             causal = n_idx <= pid_m
@@ -319,13 +268,17 @@ if triton is not None:
 
             qk = tl.sum(k * q[None, :], axis=1) * scale
             qk = tl.where(n_mask, qk, -float("inf"))
-            denom = tl.maximum(l_i, 1e-9)
-            p = tl.exp(qk - m_i) / denom
+
+            # Reuse the saved logsumexp to recover softmax probabilities directly,
+            # avoiding separate passes to recompute m_i and l_i.
+            p = tl.exp(qk - lse)
             p = tl.where(n_mask, p, 0.0)
 
             dp = tl.sum(v * do[None, :], axis=1)
             dp = tl.where(n_mask, dp, 0.0)
-            ds = p * (dp - dp_sum)
+
+            # delta = rowsum(dO * O) = sum_j(p_j * dp_j) (precomputed in Python).
+            ds = p * (dp - delta)
             ds = tl.where(n_mask, ds, 0.0)
 
             dq_acc += tl.sum(ds[:, None] * k, axis=0) * scale
@@ -362,6 +315,11 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
         scale = 1.0 / math.sqrt(head_dim)
 
         out = torch.empty_like(q)
+        # logsumexp is kept in float32 regardless of input dtype to preserve
+        # numerical precision during the backward pass: it stores m_i + log(l_i)
+        # which is used to recover exact softmax probabilities via exp(qk - lse).
+        logsumexp = torch.empty(bsz, n_heads, seq_len, dtype=torch.float32, device=q.device)
+
         block_n, block_d = _select_attention_block_sizes(seq_len=seq_len, head_dim=head_dim)
         num_warps = _select_attention_num_warps(head_dim=head_dim, block_n=block_n)
 
@@ -371,6 +329,7 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
             k,
             v,
             out,
+            logsumexp,
             q.stride(0),
             q.stride(1),
             q.stride(2),
@@ -387,6 +346,9 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
             out.stride(1),
             out.stride(2),
             out.stride(3),
+            logsumexp.stride(0),
+            logsumexp.stride(1),
+            logsumexp.stride(2),
             n_heads,
             seq_len,
             head_dim,
@@ -396,7 +358,7 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
             num_warps=num_warps,
         )
 
-        ctx.save_for_backward(q, k, v)
+        ctx.save_for_backward(q, k, v, out, logsumexp)
         ctx.scale = scale
         ctx.block_n = block_n
         ctx.block_d = block_d
@@ -405,11 +367,20 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, do: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        q, k, v = ctx.saved_tensors
+        q, k, v, out, logsumexp = ctx.saved_tensors
         bsz, n_heads, seq_len, head_dim = q.shape
 
         if not do.is_contiguous():
             do = do.contiguous()
+
+        # Precompute delta D = rowsum(dO * O) — equivalent to sum_j(p_j * dp_j).
+        # Derivation: D = sum_d(dO[d] * O[d])
+        #               = sum_d(dO[d] * sum_j(p_j * V[j][d]))
+        #               = sum_j(p_j * sum_d(dO[d] * V[j][d]))
+        #               = sum_j(p_j * dp_j)
+        # This collapses what was previously a dedicated kernel pass into a single
+        # Python-side reduction, reducing the kernel from 4 passes to 1.
+        delta = (do.float() * out.float()).sum(dim=-1).contiguous()
 
         dq = torch.empty_like(q)
         dk = torch.zeros_like(k)
@@ -424,6 +395,8 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
             dq,
             dk,
             dv,
+            logsumexp,
+            delta,
             q.stride(0),
             q.stride(1),
             q.stride(2),
@@ -452,6 +425,12 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
             dv.stride(1),
             dv.stride(2),
             dv.stride(3),
+            logsumexp.stride(0),
+            logsumexp.stride(1),
+            logsumexp.stride(2),
+            delta.stride(0),
+            delta.stride(1),
+            delta.stride(2),
             n_heads,
             seq_len,
             head_dim,
@@ -542,3 +521,4 @@ def triton_fused_causal_attention(
         return _torch_sdpa_fallback(q, k, v, scale, attention_mask)
 
     return _FusedCausalAttentionFunction.apply(q, k, v)
+
