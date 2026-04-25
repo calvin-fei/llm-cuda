@@ -89,7 +89,10 @@ if triton is not None:
         mask = offs < n_elements
 
         # Load all tensors and upcast to FP32 for arithmetic.
-        p = tl.load(param_ptr + offs, mask=mask).to(tl.float32)
+        # Keep the raw param value so we can cast back to its original dtype on store,
+        # avoiding a second round-trip to global memory just to rediscover the dtype.
+        param_raw = tl.load(param_ptr + offs, mask=mask)
+        p = param_raw.to(tl.float32)
         g = tl.load(grad_ptr + offs, mask=mask).to(tl.float32)
         m = tl.load(exp_avg_ptr + offs, mask=mask).to(tl.float32)
         v = tl.load(exp_avg_sq_ptr + offs, mask=mask).to(tl.float32)
@@ -109,8 +112,7 @@ if triton is not None:
         tl.store(exp_avg_ptr + offs, m, mask=mask)
         tl.store(exp_avg_sq_ptr + offs, v, mask=mask)
 
-        # Store parameter in original dtype.
-        param_raw = tl.load(param_ptr + offs, mask=mask)
+        # Store parameter in its original dtype (saved from the initial load above).
         tl.store(param_ptr + offs, p.to(param_raw.dtype), mask=mask)
 
 

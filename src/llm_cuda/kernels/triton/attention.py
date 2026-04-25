@@ -120,7 +120,10 @@ if triton is not None:
         l_i = 0.0
         acc = tl.zeros((BLOCK_DMODEL,), dtype=tl.float32)
 
-        for start_n in tl.range(0, seq_len, BLOCK_N):
+        # Iterate only over KV tiles that overlap with the causal region [0, pid_m].
+        # Tiles where start_n > pid_m would be entirely masked out; skipping them
+        # avoids loading K/V blocks that contribute nothing to the output.
+        for start_n in tl.range(0, pid_m + 1, BLOCK_N):
             n_idx = start_n + offs_n
             n_mask = n_idx < seq_len
 
@@ -243,7 +246,10 @@ if triton is not None:
 
         dq_acc = tl.zeros((BLOCK_DMODEL,), dtype=tl.float32)
 
-        for start_n in tl.range(0, seq_len, BLOCK_N):
+        # Iterate only over KV tiles that overlap with the causal region [0, pid_m].
+        # All positions n > pid_m are causally masked and their contributions to dQ,
+        # dK, and dV are zero — skipping those tiles saves ~50% of K/V loads on average.
+        for start_n in tl.range(0, pid_m + 1, BLOCK_N):
             n_idx = start_n + offs_n
             causal = n_idx <= pid_m
             n_mask = (n_idx < seq_len) & causal
