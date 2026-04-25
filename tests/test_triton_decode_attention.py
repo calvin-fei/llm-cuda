@@ -20,6 +20,9 @@ from llm_cuda.kernels.triton.decode_attention import (
 # ---------------------------------------------------------------------------
 
 
+_TEST_SEED: int = 42
+
+
 def _reference_decode_attention(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -43,10 +46,10 @@ def _reference_decode_attention(
     out = torch.empty_like(q)
     for b in range(bsz):
         for h in range(n_heads):
-            kv_h = h // kv_groups
+            kv_head_idx = h // kv_groups
             q_vec = q[b, h, 0, :].float()  # [head_dim]
-            k_mat = k[b, kv_h, :, :].float()  # [kv_len, head_dim]
-            v_mat = v[b, kv_h, :, :].float()  # [kv_len, head_dim]
+            k_mat = k[b, kv_head_idx, :, :].float()  # [kv_len, head_dim]
+            v_mat = v[b, kv_head_idx, :, :].float()  # [kv_len, head_dim]
 
             scores = (k_mat @ q_vec) * scale  # [kv_len]
             probs = torch.softmax(scores, dim=0)  # [kv_len]
@@ -149,7 +152,7 @@ def _run_correctness(
     atol: float = 1e-4,
     rtol: float = 1e-4,
 ) -> None:
-    torch.manual_seed(42)
+    torch.manual_seed(_TEST_SEED)
     q = torch.randn(bsz, n_heads, 1, head_dim, dtype=dtype, device=device)
     k = torch.randn(bsz, n_kv_heads, kv_len, head_dim, dtype=dtype, device=device)
     v = torch.randn(bsz, n_kv_heads, kv_len, head_dim, dtype=dtype, device=device)

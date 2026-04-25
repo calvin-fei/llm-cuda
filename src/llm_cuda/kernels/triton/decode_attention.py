@@ -25,6 +25,22 @@ except ImportError:  # pragma: no cover
     triton = None
     tl = None
 
+# Numerical stability epsilon applied after the online-softmax normaliser.
+_ATTN_EPSILON: float = 1e-9
+
+# BLOCK_D bounds: head_dim is rounded up to the next power of 2 and clamped
+# into [_MIN_BLOCK_D, _MAX_BLOCK_D].
+_MIN_BLOCK_D: int = 16
+_MAX_BLOCK_D: int = 256
+
+# KV-sequence thresholds and matching BLOCK_N tile sizes.
+# Larger tiles improve memory-bandwidth utilisation for long KV caches.
+_KV_LEN_THRESHOLD_LARGE: int = 2048
+_KV_LEN_THRESHOLD_MED: int = 512
+_BLOCK_N_LARGE: int = 128
+_BLOCK_N_MED: int = 64
+_BLOCK_N_SMALL: int = 32
+
 
 if triton is not None:
 
@@ -135,7 +151,7 @@ if triton is not None:
             m_i = m_new
 
         # Normalise and write output: o[bsz_idx, head_idx, 0, offs_d]
-        out = acc / tl.maximum(l_i, 1e-9)
+        out = acc / tl.maximum(l_i, _ATTN_EPSILON)
         tl.store(
             o_ptr + bsz_idx * stride_ob + head_idx * stride_oh + offs_d * stride_od,
             out,
@@ -168,8 +184,8 @@ def can_use_triton_decode_attention(
         return False
     if q.shape[-1] != k.shape[-1] or q.shape[-1] != v.shape[-1]:
         return False
-    # head_dim cap: BLOCK_D is capped at 256.
-    if q.shape[-1] > 256:
+    # head_dim cap: BLOCK_D is capped at _MAX_BLOCK_D.
+    if q.shape[-1] > _MAX_BLOCK_D:
         return False
     # K/V shapes must match.
     if k.shape != v.shape:
@@ -220,17 +236,17 @@ def triton_decode_attention(
 
     out = torch.empty_like(q)
 
-    # BLOCK_D: smallest power of 2 >= head_dim, capped at 256.
+    # BLOCK_D: smallest power of 2 >= head_dim, clamped to [_MIN_BLOCK_D, _MAX_BLOCK_D].
     block_d = triton.next_power_of_2(head_dim)
-    block_d = min(max(block_d, 16), 256)
+    block_d = min(max(block_d, _MIN_BLOCK_D), _MAX_BLOCK_D)
 
     # BLOCK_N: larger tiles improve bandwidth for long KV sequences.
-    if kv_len >= 2048:
-        block_n = 128
-    elif kv_len >= 512:
-        block_n = 64
+    if kv_len >= _KV_LEN_THRESHOLD_LARGE:
+        block_n = _BLOCK_N_LARGE
+    elif kv_len >= _KV_LEN_THRESHOLD_MED:
+        block_n = _BLOCK_N_MED
     else:
-        block_n = 32
+        block_n = _BLOCK_N_SMALL
 
     num_warps = 4 if block_n * block_d >= 4096 else 2
 
