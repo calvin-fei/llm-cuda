@@ -18,6 +18,7 @@ class Llama3Config:
     pad_token_id: int = 0
     bos_token_id: int = 128000
     eos_token_id: int = 128001
+    gradient_checkpointing: bool = False
 
     def __post_init__(self) -> None:
         if self.tensor_parallel_size < 1:

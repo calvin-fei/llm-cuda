@@ -1,6 +1,7 @@
 import torch
 import torch.nn as nn
 
+from llm_cuda.kernels.triton.cross_entropy import triton_cross_entropy
 from llm_cuda.parallel.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 
 from .attention import Llama3Attention
@@ -60,17 +61,35 @@ class Llama3Model(nn.Module):
         x = self.embed_tokens(input_ids)
         next_past_key_values: list[tuple[torch.Tensor, torch.Tensor]] = []
 
+        use_grad_ckpt = self.config.gradient_checkpointing and self.training
+
         for idx, layer in enumerate(self.layers):
             if isinstance(past_key_values, PagedKVCache):
                 layer_past = past_key_values.get_layer(idx)
             else:
                 layer_past = None if past_key_values is None else past_key_values[idx]
-            x, present = layer(
-                x,
-                attention_mask=attention_mask,
-                past_key_value=layer_past,
-                use_cache=use_cache,
-            )
+
+            if use_grad_ckpt and layer_past is None and not use_cache:
+                # Gradient checkpointing: recompute activations in the backward pass
+                # instead of storing them, trading compute for memory.  Only applied
+                # during training and when no KV-cache state is active (the KV cache
+                # returns mutable tensors that cannot be safely rewound by checkpoint).
+                def _ckpt_forward(layer, x, attention_mask):  # noqa: E306
+                    out, _ = layer(x, attention_mask=attention_mask, past_key_value=None, use_cache=False)
+                    return out
+
+                x = torch.utils.checkpoint.checkpoint(
+                    _ckpt_forward, layer, x, attention_mask, use_reentrant=False
+                )
+                present = None
+            else:
+                x, present = layer(
+                    x,
+                    attention_mask=attention_mask,
+                    past_key_value=layer_past,
+                    use_cache=use_cache,
+                )
+
             if use_cache and present is not None and not isinstance(past_key_values, PagedKVCache):
                 next_past_key_values.append(present)
         x = self.norm(x)
@@ -140,10 +159,14 @@ class Llama3ForCausalLM(nn.Module):
         if labels is not None:
             shift_logits = logits[:, :-1, :].contiguous()
             shift_labels = labels[:, 1:].contiguous()
-            loss = nn.functional.cross_entropy(
+            # Fused Triton cross-entropy: avoids materialising the [N, V] softmax
+            # probability matrix.  For Llama 3's 128K vocab this cuts peak memory by
+            # ~2× compared to the standard F.cross_entropy path.
+            loss = triton_cross_entropy(
                 shift_logits.view(-1, self.config.vocab_size),
                 shift_labels.view(-1),
                 ignore_index=-100,
+                reduction="mean",
             )
 
         return {
