@@ -120,7 +120,13 @@ if triton is not None:
         l_i = 0.0
         acc = tl.zeros((BLOCK_DMODEL,), dtype=tl.float32)
 
-        for start_n in tl.range(0, seq_len, BLOCK_N):
+        # Iterate only over KV tiles that overlap with the causal region [0, pid_m].
+        # pid_m is a scalar token position (one program per query row; see grid =
+        # (seq_len, bsz * n_heads)), so the exclusive upper bound pid_m + 1 means
+        # tl.range emits tile starts 0, BLOCK_N, 2*BLOCK_N … up to and including
+        # the tile that contains position pid_m.  Tiles beyond pid_m are entirely
+        # masked by causal_mask and load nothing useful.
+        for start_n in tl.range(0, pid_m + 1, BLOCK_N):
             n_idx = start_n + offs_n
             n_mask = n_idx < seq_len
 
@@ -243,7 +249,13 @@ if triton is not None:
 
         dq_acc = tl.zeros((BLOCK_DMODEL,), dtype=tl.float32)
 
-        for start_n in tl.range(0, seq_len, BLOCK_N):
+        # Iterate only over KV tiles that overlap with the causal region [0, pid_m].
+        # pid_m is a scalar token position (one program per query row), so
+        # tl.range(0, pid_m + 1, BLOCK_N) emits tile starts 0, BLOCK_N, … up to
+        # and including the tile that contains position pid_m.  Positions n > pid_m
+        # have zero causal contribution to dQ, dK, and dV, so those tiles are
+        # safely skipped, saving ~50% of K/V loads on average across the sequence.
+        for start_n in tl.range(0, pid_m + 1, BLOCK_N):
             n_idx = start_n + offs_n
             causal = n_idx <= pid_m
             n_mask = (n_idx < seq_len) & causal

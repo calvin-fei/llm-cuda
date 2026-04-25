@@ -150,11 +150,14 @@ if triton is not None:
             offs = start + tl.arange(0, BLOCK_V)
             mask = offs < n_cols
 
-            x = tl.load(
+            # Load logit tile once; save the raw value to reuse its dtype on store,
+            # avoiding a second round-trip to global memory just to discover the dtype.
+            x_raw = tl.load(
                 logits_ptr + row * stride_logits_row + offs,
                 mask=mask,
                 other=0.0,
-            ).to(tl.float32)
+            )
+            x = x_raw.to(tl.float32)
 
             # Recover softmax probability from saved lse (no extra memory).
             softmax_val = tl.exp(x - lse)
@@ -166,14 +169,9 @@ if triton is not None:
             dlogit = tl.where(is_valid, grad * softmax_val, 0.0)
 
             # Match output dtype to logits dtype; all arithmetic was in FP32.
-            raw = tl.load(
-                logits_ptr + row * stride_logits_row + offs,
-                mask=mask,
-                other=0.0,
-            )
             tl.store(
                 dlogits_ptr + row * stride_dlogits_row + offs,
-                dlogit.to(raw.dtype),
+                dlogit.to(x_raw.dtype),
                 mask=mask,
             )
 

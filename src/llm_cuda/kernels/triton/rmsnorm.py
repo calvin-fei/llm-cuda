@@ -32,11 +32,15 @@ if triton is not None:
         x = tl.load(x_row_ptr, mask=mask, other=0.0)
         w = tl.load(w_ptrs, mask=mask, other=1.0)
 
-        var = tl.sum(x * x, axis=0) / hidden_size
+        # Upcast to float32 for the variance accumulation and scale application so that
+        # FP16 inputs don't overflow during x * x or lose precision in the reduction.
+        x_f32 = x.to(tl.float32)
+        w_f32 = w.to(tl.float32)
+        var = tl.sum(x_f32 * x_f32, axis=0) / hidden_size
         inv_rms = tl.rsqrt(var + eps)
-        y = x * inv_rms * w
+        y = x_f32 * inv_rms * w_f32
 
-        tl.store(y_row_ptr, y, mask=mask)
+        tl.store(y_row_ptr, y.to(x.dtype), mask=mask)
 
 
 def triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
@@ -53,6 +57,7 @@ def triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.
 
     block_size = triton.next_power_of_2(hidden)
     block_size = min(max(block_size, 128), 4096)
+    num_warps = 8 if block_size >= 2048 else 4
 
     grid = (x_2d.shape[0],)
     _rmsnorm_kernel[grid](
@@ -64,6 +69,7 @@ def triton_rms_norm(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.
         hidden,
         eps,
         BLOCK_SIZE=block_size,
+        num_warps=num_warps,
     )
 
     return y_2d.view(bsz, seq_len, hidden)
