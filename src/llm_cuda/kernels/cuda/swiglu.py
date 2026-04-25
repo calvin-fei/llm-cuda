@@ -10,7 +10,7 @@ def cuda_swiglu_extension(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor 
     if gate.shape != up.shape:
         return None
 
-    if gate.dtype not in (torch.float16, torch.float32):
+    if gate.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
 
     ext = load_cuda_extension(verbose=False)

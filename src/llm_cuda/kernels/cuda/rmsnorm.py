@@ -12,7 +12,7 @@ def cuda_rms_norm_extension(x: torch.Tensor, weight: torch.Tensor, eps: float) -
     if not x.is_cuda or not weight.is_cuda:
         return None
 
-    if x.dtype not in (torch.float16, torch.float32):
+    if x.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
 
     ext = load_cuda_extension(verbose=False)

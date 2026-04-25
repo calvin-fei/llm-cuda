@@ -10,7 +10,7 @@ from llm_cuda.parallel.tensor_parallel import ColumnParallelLinear, RowParallelL
 
 from .config import Llama3Config
 from .kv_cache import PagedKVLayerCache
-from .rotary import apply_rotary, build_rope_cache
+from .rotary import apply_rotary, build_inv_freq, build_rope_cache
 
 
 class Llama3Attention(nn.Module):
@@ -36,6 +36,18 @@ class Llama3Attention(nn.Module):
             self.k_proj = nn.Linear(config.hidden_size, kv_size, bias=False)
             self.v_proj = nn.Linear(config.hidden_size, kv_size, bias=False)
             self.o_proj = nn.Linear(q_size, config.hidden_size, bias=False)
+
+        # Pre-compute inv_freq once and register as a non-persistent buffer so
+        # it moves with the module to the correct device but is not saved in
+        # state_dict checkpoints.  This avoids recomputing arange + pow on
+        # every forward step (critical during decode where one token is
+        # processed per step).
+        inv_freq = build_inv_freq(
+            head_dim=config.head_dim,
+            base=config.rope_theta,
+            device=torch.device("cpu"),
+        )
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
 
     def _shape(self, x: torch.Tensor, heads: int) -> torch.Tensor:
         bsz, seq_len, _ = x.shape
@@ -102,6 +114,7 @@ class Llama3Attention(nn.Module):
             device=x.device,
             dtype=x.dtype,
             position_offset=past_len,
+            inv_freq=self.inv_freq,
         )
         q, k = apply_rotary(q, k, cos, sin)
 

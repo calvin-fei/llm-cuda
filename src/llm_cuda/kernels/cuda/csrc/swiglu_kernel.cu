@@ -39,8 +39,13 @@ torch::Tensor swiglu_forward_cuda(torch::Tensor gate_2d, torch::Tensor up_2d) {
   constexpr int threads = 256;
   dim3 blocks(rows);
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(gate_2d.scalar_type(), "swiglu_forward_cuda", [&] {
-    swiglu_forward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      gate_2d.scalar_type(),
+      "swiglu_forward_cuda",
+      [&] {
+        swiglu_forward_kernel<scalar_t><<<blocks, threads, 0, at::cuda::getDefaultCUDAStream()>>>(
         gate_2d.data_ptr<scalar_t>(),
         up_2d.data_ptr<scalar_t>(),
         out.data_ptr<scalar_t>(),

@@ -41,6 +41,52 @@ if triton is not None:
 
         tl.store(out_row, y.to(g.dtype), mask=mask)
 
+    @triton.jit
+    def _swiglu_bwd_kernel(
+        grad_out_ptr,
+        gate_ptr,
+        up_ptr,
+        dgate_ptr,
+        dup_ptr,
+        stride_m,
+        hidden_size,
+        BLOCK_SIZE: tl.constexpr,
+    ):
+        """Fused SwiGLU backward kernel.
+
+        Computes ``dgate`` and ``dup`` in a single pass over ``(grad_out,
+        gate, up)``, replacing three separate PyTorch element-wise ops.
+
+        Let ``sig = sigmoid(gate)`` and ``silu = gate * sig``; then:
+
+        .. code-block:: none
+
+            dgate = grad_out * up  * sig * (1 + gate * (1 - sig))
+            dup   = grad_out * (gate * sig)
+        """
+        row = tl.program_id(0)
+        cols = tl.arange(0, BLOCK_SIZE)
+        mask = cols < hidden_size
+
+        go = tl.load(grad_out_ptr + row * stride_m + cols, mask=mask, other=0.0)
+        g = tl.load(gate_ptr + row * stride_m + cols, mask=mask, other=0.0)
+        u = tl.load(up_ptr + row * stride_m + cols, mask=mask, other=0.0)
+
+        go_f = go.to(tl.float32)
+        g_f = g.to(tl.float32)
+        u_f = u.to(tl.float32)
+
+        sig = 1.0 / (1.0 + tl.exp(-g_f))
+        # d/dg [g * sigmoid(g)] = sigmoid(g) * (1 + g * (1 - sigmoid(g)))
+        dsilu_dg = sig * (1.0 + g_f * (1.0 - sig))
+
+        dgate = go_f * u_f * dsilu_dg
+        dup = go_f * (g_f * sig)
+
+        orig_dtype = go.dtype
+        tl.store(dgate_ptr + row * stride_m + cols, dgate.to(orig_dtype), mask=mask)
+        tl.store(dup_ptr + row * stride_m + cols, dup.to(orig_dtype), mask=mask)
+
 
 class _SwiGLUFunction(torch.autograd.Function):
     @staticmethod
@@ -101,9 +147,50 @@ class _SwiGLUFunction(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad_out: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         gate, up = ctx.saved_tensors
+
+        # Use the fused Triton backward kernel when possible to avoid three
+        # separate PyTorch element-wise passes over (grad_out, gate, up).
+        if (
+            triton is not None
+            and gate.is_cuda
+            and up.is_cuda
+            and grad_out.is_cuda
+            and gate.dtype in (torch.float16, torch.bfloat16, torch.float32)
+        ):
+            if not grad_out.is_contiguous():
+                grad_out = grad_out.contiguous()
+
+            orig_shape = gate.shape
+            hidden_size = orig_shape[-1]
+            go_2d = grad_out.view(-1, hidden_size)
+            gate_2d = gate.view(-1, hidden_size)
+            up_2d = up.view(-1, hidden_size)
+
+            rows = go_2d.shape[0]
+            dgate_2d = torch.empty_like(gate_2d)
+            dup_2d = torch.empty_like(up_2d)
+
+            block_size = triton.next_power_of_2(hidden_size)
+            block_size = min(max(block_size, 128), 4096)
+            num_warps = 8 if block_size >= 2048 else 4
+
+            _swiglu_bwd_kernel[(rows,)](
+                go_2d,
+                gate_2d,
+                up_2d,
+                dgate_2d,
+                dup_2d,
+                go_2d.stride(0),
+                hidden_size,
+                BLOCK_SIZE=block_size,
+                num_warps=num_warps,
+            )
+
+            return dgate_2d.view(orig_shape), dup_2d.view(orig_shape)
+
+        # PyTorch fallback.
         sig = torch.sigmoid(gate)
         dsilu = sig * (1.0 + gate * (1.0 - sig))
-
         dgate = grad_out * up * dsilu
         dup = grad_out * (gate * sig)
         return dgate, dup

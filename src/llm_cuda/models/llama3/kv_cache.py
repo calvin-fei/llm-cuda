@@ -49,12 +49,16 @@ class PagedKVLayerCache:
         if self.length + seq > self.max_seq_len:
             raise ValueError("Appending would exceed max_seq_len")
 
+        # Compute page index and intra-page offset for every token in one shot
+        # using vectorised integer arithmetic instead of a Python for-loop.
+        # This is critical during prefill (seq > 1) and avoids Python overhead.
+        positions = torch.arange(self.length, self.length + seq, dtype=torch.long)
+        page_indices = (positions // self.page_size).tolist()
+        slot_offsets = (positions % self.page_size).tolist()
+
         for i in range(seq):
-            t = self.length + i
-            page_idx = t // self.page_size
-            offset = t % self.page_size
-            self.key_pages[page_idx, :, offset, :] = k[0, :, i, :]
-            self.value_pages[page_idx, :, offset, :] = v[0, :, i, :]
+            self.key_pages[page_indices[i], :, slot_offsets[i], :] = k[0, :, i, :]
+            self.value_pages[page_indices[i], :, slot_offsets[i], :] = v[0, :, i, :]
 
         self.length += seq
 
