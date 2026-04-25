@@ -21,7 +21,7 @@ def cuda_causal_attention_extension(
     if q.dim() != 4:
         return None
 
-    if q.dtype not in (torch.float16, torch.float32):
+    if q.dtype not in (torch.float16, torch.bfloat16, torch.float32):
         return None
 
     ext = load_cuda_extension(verbose=False)
