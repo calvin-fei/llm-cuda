@@ -59,15 +59,21 @@ torch::Tensor rms_norm_forward_cuda(torch::Tensor x_2d, torch::Tensor weight, do
   dim3 blocks(rows);
   size_t smem = threads * sizeof(float);
 
-  AT_DISPATCH_FLOATING_TYPES_AND_HALF(x_2d.scalar_type(), "rms_norm_forward_cuda", [&] {
-    rms_norm_kernel<scalar_t><<<blocks, threads, smem, at::cuda::getDefaultCUDAStream()>>>(
-        x_2d.data_ptr<scalar_t>(),
-        weight.data_ptr<scalar_t>(),
-        y.data_ptr<scalar_t>(),
-        rows,
-        hidden,
-        static_cast<float>(eps));
-  });
+  AT_DISPATCH_FLOATING_TYPES_AND2(
+      at::kHalf,
+      at::kBFloat16,
+      x_2d.scalar_type(),
+      "rms_norm_forward_cuda",
+      [&] {
+        rms_norm_kernel<scalar_t>
+            <<<blocks, threads, smem, at::cuda::getDefaultCUDAStream()>>>(
+                x_2d.data_ptr<scalar_t>(),
+                weight.data_ptr<scalar_t>(),
+                y.data_ptr<scalar_t>(),
+                rows,
+                hidden,
+                static_cast<float>(eps));
+      });
 
   return y;
 }
