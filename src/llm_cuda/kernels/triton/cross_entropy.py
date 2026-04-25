@@ -2,7 +2,7 @@
 
 The standard approach—``F.cross_entropy(logits.view(-1, V), labels.view(-1))``—first
 materialises the full ``[N, V]`` softmax probability matrix and then reduces it.  For
-Llama 3 with V = 128 256, a single prefill step at batch 4 × sequence 2 048 creates a
+Llama 3 with V = 128,256, a single prefill step at batch 4 × sequence 2,048 creates a
 ~8 GB FP16 intermediate, making large-batch training GPU-memory bound at the loss step
 alone.
 

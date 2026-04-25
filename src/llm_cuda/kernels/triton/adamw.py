@@ -47,8 +47,8 @@ except ImportError:  # pragma: no cover
     triton = None
     tl = None
 
-# Elements processed per Triton program.  128 matches a typical cache-line multiple
-# for FP32 (128 × 4 B = 512 B) and maps to 4 warps × 32 threads.
+# Elements processed per Triton program.  512 matches 4 cache lines for FP32
+# (512 × 4 B = 2 KB) and maps comfortably onto 4 warps × 32 threads × 4 elements.
 _BLOCK_SIZE: int = 512
 
 
