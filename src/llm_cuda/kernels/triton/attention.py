@@ -315,7 +315,9 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
         scale = 1.0 / math.sqrt(head_dim)
 
         out = torch.empty_like(q)
-        # logsumexp stores m_i + log(l_i) per query position, used in backward.
+        # logsumexp is kept in float32 regardless of input dtype to preserve
+        # numerical precision during the backward pass: it stores m_i + log(l_i)
+        # which is used to recover exact softmax probabilities via exp(qk - lse).
         logsumexp = torch.empty(bsz, n_heads, seq_len, dtype=torch.float32, device=q.device)
 
         block_n, block_d = _select_attention_block_sizes(seq_len=seq_len, head_dim=head_dim)
@@ -372,6 +374,10 @@ class _FusedCausalAttentionFunction(torch.autograd.Function):
             do = do.contiguous()
 
         # Precompute delta D = rowsum(dO * O) — equivalent to sum_j(p_j * dp_j).
+        # Derivation: D = sum_d(dO[d] * O[d])
+        #               = sum_d(dO[d] * sum_j(p_j * V[j][d]))
+        #               = sum_j(p_j * sum_d(dO[d] * V[j][d]))
+        #               = sum_j(p_j * dp_j)
         # This collapses what was previously a dedicated kernel pass into a single
         # Python-side reduction, reducing the kernel from 4 passes to 1.
         delta = (do.float() * out.float()).sum(dim=-1).contiguous()
