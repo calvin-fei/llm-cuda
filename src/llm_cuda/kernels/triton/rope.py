@@ -46,6 +46,8 @@ if triton is not None:
         stride_xd,
         stride_cos_s,
         stride_cos_d,
+        stride_sin_s,
+        stride_sin_d,
         stride_ob,
         stride_oh,
         stride_os,
@@ -89,7 +91,7 @@ if triton is not None:
             + seq_idx * stride_xs
         )
         cos_base = cos_ptr + seq_idx * stride_cos_s
-        sin_base = sin_ptr + seq_idx * stride_cos_s
+        sin_base = sin_ptr + seq_idx * stride_sin_s
         out_base = (
             out_ptr
             + bsz_idx * stride_ob
@@ -103,7 +105,7 @@ if triton is not None:
 
         # Load cos/sin (first half only — second half is identical).
         cos_v = tl.load(cos_base + offs * stride_cos_d, mask=mask, other=1.0)
-        sin_v = tl.load(sin_base + offs * stride_cos_d, mask=mask, other=0.0)
+        sin_v = tl.load(sin_base + offs * stride_sin_d, mask=mask, other=0.0)
 
         # Apply rotation in float32 for numerical stability.
         x1_f = x1.to(tl.float32)
@@ -204,6 +206,8 @@ def triton_apply_rope(
         x.stride(3),
         cos.stride(0),
         cos.stride(1),
+        sin.stride(0),
+        sin.stride(1),
         out.stride(0),
         out.stride(1),
         out.stride(2),
